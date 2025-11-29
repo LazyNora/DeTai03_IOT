@@ -19,9 +19,11 @@
 
 // Your WiFi credentials.
 // Set password to "" for open networks.
-//char ssid[] = "\xE2\x8B\x88";
-char ssid[] = "Nora";
-char pass[] = "Nora1911";
+//char ssid[] = "Nora";
+//char pass[] = "Nora1911";
+char ssid[] = "\xE2\x8B\x88";
+char pass[] = "Nora#1911";
+
 
 // Blynk virtual pin aliases
 #define VP_STATUS V1
@@ -119,6 +121,16 @@ long last_detected_millis = 0;
 long last_sent_no_face_millis = 0;
 const long NO_FACE_MSG_INTERVAL = 3000;
 
+// Enrollment timing control
+long last_enroll_sample_millis = 0;
+const long ENROLL_SAMPLE_INTERVAL = 500;  // minimum 500ms between enrollment samples
+bool enrollment_in_progress = false;
+int enrollment_samples_taken = 0;
+
+// Recognition timing control (prevent servo spam)
+long last_recognition_action_millis = 0;
+const long RECOGNITION_ACTION_INTERVAL = 3000;  // minimum 3 seconds between door opens
+
 int v12_selected_index = 0;  // 0..7 as user requested; 0 -> none
 
 // Forward declarations for functions
@@ -165,6 +177,8 @@ BLYNK_WRITE(VP_ENROLL) {
       return;
     }
     g_state = START_ENROLL;
+    enrollment_in_progress = true;
+    enrollment_samples_taken = 0;
     Blynk.virtualWrite(VP_STATUS, String("Enrollment started for: ") + st_name.enroll_name);
   }
 }
@@ -240,11 +254,11 @@ BLYNK_WRITE(VP_MENU) {
 BLYNK_WRITE(VP_DELSEL) {
   int v = param.asInt();
   if (!v) return;
-  if (v12_selected_index <= 0 || v12_selected_index > FACE_ID_SAVE_NUMBER) {
-    Blynk.virtualWrite(VP_STATUS, "Delete selected: invalid index (choose 1..7)");
+  if (v12_selected_index < 0 || v12_selected_index > FACE_ID_SAVE_NUMBER) {
+    Blynk.virtualWrite(VP_STATUS, "Delete selected: invalid index (choose 0..6)");
     return;
   }
-  int idx0 = v12_selected_index - 1;  // convert to 0-based
+  int idx0 = v12_selected_index;  // convert to 0-based
   String name = get_enrolled_name_by_index(idx0);
   if (name.length() == 0) {
     Blynk.virtualWrite(VP_STATUS, "No user in selected slot");
@@ -268,18 +282,38 @@ void update_video_url_to_blynk() {
 }
 
 void send_enrolled_list_to_blynk() {
+  // Update VP_LIST with comma-separated user names
   if (st_face_list.count == 0) {
     Blynk.virtualWrite(VP_LIST, "No users");
-    return;
+  } else {
+    face_id_node *node = st_face_list.head;
+    String out = "";
+    for (int i = 0; i < st_face_list.count && node != NULL; ++i) {
+      if (i) out += ", ";
+      out += String(node->id_name);
+      node = node->next;
+    }
+    Blynk.virtualWrite(VP_LIST, out);
   }
+
+  // Update VP_MENU labels with enrolled user names
+  // Build menu items:
+  BlynkParamAllocated items(10);
+  items.add("Select user...");
+
+  // Fill in enrolled users
   face_id_node *node = st_face_list.head;
-  String out = "";
-  for (int i = 0; i < st_face_list.count && node != NULL; ++i) {
-    if (i) out += ", ";
-    out += String(node->id_name);
-    node = node->next;
+  for (int i = 0; i < FACE_ID_SAVE_NUMBER; i++) {
+    if (i < st_face_list.count && node != NULL) {
+      items.add(String(i + 1) + ". " + String(node->id_name));
+      node = node->next;
+    } else {
+      items.add("Empty");
+    }
   }
-  Blynk.virtualWrite(VP_LIST, out);
+
+  // Set the menu property with all labels
+  Blynk.setProperty(VP_MENU, "labels", items);
 }
 
 String get_enrolled_name_by_index(int idx) {
@@ -306,13 +340,15 @@ void openServo() {
   myservo.write(90);  // open
   door_is_open = true;
   door_opened_millis = millis();
-  Blynk.virtualWrite(VP_STATUS, "Servo OPEN (90°)");
+  // Blynk.virtualWrite(VP_STATUS, "Servo OPEN (90°)");
+  Blynk.virtualWrite(VP_SERVO, 90);
 }
 
 void closeServo() {
   myservo.write(0);  // closed
   door_is_open = false;
   Blynk.virtualWrite(VP_STATUS, "Servo CLOSED (0°)");
+  Blynk.virtualWrite(VP_SERVO, 0);
 }
 
 httpd_handle_t stream_httpd = NULL;
@@ -407,8 +443,11 @@ void setup() {
   Serial.println("Starting Blynk + FaceNet sketch...");
 
   // servo and LED init
+  // Allocate timer 3 for servo (camera uses timer 0)
+  ESP32PWM::allocateTimer(3);
   myservo.setPeriodHertz(50);
-  myservo.attach(servoPin, 1000, 2000);
+  // SG90 servo: use wider pulse range (500-2400µs) for full 180° range
+  myservo.attach(servoPin, 500, 2400);
   myservo.write(0);  // start closed
   pinMode(ledPin, OUTPUT);
   digitalWrite(ledPin, LOW);
@@ -539,36 +578,54 @@ void loop() {
           Blynk.virtualWrite(VP_STATUS, "FACE DETECTED");
         }
 
-        if (g_state == START_ENROLL) {
-          int left_sample_face = do_enrollment(&st_face_list, out_res.face_id);
-          char enrolling_message[64];
-          sprintf(enrolling_message, "SAMPLE %d FOR %s", ENROLL_CONFIRM_TIMES - left_sample_face, st_name.enroll_name);
-          Blynk.virtualWrite(VP_STATUS, enrolling_message);
-          if (left_sample_face == 0) {
-            // Enrollment complete
-            g_state = START_STREAM;
-            char captured_message[64];
-            sprintf(captured_message, "FACE CAPTURED FOR %s", st_face_list.tail->id_name);
-            Blynk.virtualWrite(VP_STATUS, captured_message);
-            // refresh list to V10
-            send_enrolled_list_to_blynk();
+        if (g_state == START_ENROLL && enrollment_in_progress) {
+          // Rate-limit enrollment samples to prevent rapid-fire captures
+          if (millis() - last_enroll_sample_millis >= ENROLL_SAMPLE_INTERVAL) {
+            int left_sample_face = do_enrollment(&st_face_list, out_res.face_id);
+            last_enroll_sample_millis = millis();
+            enrollment_samples_taken++;
 
-            st_name.enroll_name[0] = '\0';
-            Blynk.virtualWrite(VP_NAME_IN, st_name.enroll_name);
-            Blynk.virtualWrite(VP_ENROLL, 0);
+            char enrolling_message[64];
+            sprintf(enrolling_message, "SAMPLE %d/%d FOR %s", enrollment_samples_taken, ENROLL_CONFIRM_TIMES, st_name.enroll_name);
+            Blynk.virtualWrite(VP_STATUS, enrolling_message);
+
+            if (left_sample_face == 0 || enrollment_samples_taken >= ENROLL_CONFIRM_TIMES) {
+              // Enrollment complete - immediately stop enrollment
+              enrollment_in_progress = false;
+              g_state = START_STREAM;
+
+              char captured_message[64];
+              sprintf(captured_message, "ENROLLMENT COMPLETE FOR %s", st_face_list.tail->id_name);
+              Blynk.virtualWrite(VP_STATUS, captured_message);
+              // refresh list to V10
+              send_enrolled_list_to_blynk();
+
+              st_name.enroll_name[0] = '\0';
+              Blynk.virtualWrite(VP_NAME_IN, st_name.enroll_name);
+              Blynk.virtualWrite(VP_ENROLL, 0);
+              enrollment_samples_taken = 0;
+            }
           }
         }
 
         if (g_state == START_RECOGNITION && (st_face_list.count > 0)) {
           face_id_node *f = recognize_face_with_name(&st_face_list, out_res.face_id);
           if (f) {
-            char recognised_message[64];
-            sprintf(recognised_message, "DOOR OPEN FOR %s", f->id_name);
-            Blynk.virtualWrite(VP_STATUS, recognised_message);
-            // open servo (instead of old relay)
-            openServo();
+            // Only open door if enough time has passed since last recognition action
+            if (millis() - last_recognition_action_millis >= RECOGNITION_ACTION_INTERVAL) {
+              char recognised_message[64];
+              sprintf(recognised_message, "DOOR OPEN FOR %s", f->id_name);
+              Blynk.virtualWrite(VP_STATUS, recognised_message);
+              // open servo (instead of old relay)
+              openServo();
+              last_recognition_action_millis = millis();
+            }
           } else {
-            Blynk.virtualWrite(VP_STATUS, "FACE NOT RECOGNISED");
+            // Rate-limit "not recognised" messages too
+            if (millis() - last_sent_no_face_millis > NO_FACE_MSG_INTERVAL) {
+              Blynk.virtualWrite(VP_STATUS, "FACE NOT RECOGNISED");
+              last_sent_no_face_millis = millis();
+            }
           }
         }
         if (out_res.face_id) dl_matrix3d_free(out_res.face_id);
